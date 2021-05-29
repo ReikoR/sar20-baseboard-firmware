@@ -18,12 +18,11 @@
   */
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
-#include <string.h>
 #include "main.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+#include <string.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -50,6 +49,8 @@ typedef struct __attribute__((packed)) DebugCommand {
 CRC_HandleTypeDef hcrc;
 
 TIM_HandleTypeDef htim16;
+TIM_HandleTypeDef htim17;
+DMA_HandleTypeDef hdma_tim17_ch1;
 
 UART_HandleTypeDef huart3;
 DMA_HandleTypeDef hdma_usart3_rx;
@@ -71,6 +72,7 @@ static void MX_DMA_Init(void);
 static void MX_TIM16_Init(void);
 static void MX_USART3_UART_Init(void);
 static void MX_CRC_Init(void);
+static void MX_TIM17_Init(void);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
@@ -84,6 +86,23 @@ uint32_t uartRxEventCallbackCounter = 0;
 uint32_t uartRxEventCallbackByteCounter = 0;
 volatile uint32_t hasReceivedUARTCommand = 0;
 uint32_t shouldSendDebugInfo = 0;
+
+uint16_t ledPWMPeriods[49] = {};
+uint8_t ledColorValues[6] = {50, 50, 50, 50, 50, 50};
+
+void setLEDs(uint8_t grbValues[]) {
+    for (int i = 0; i < 6; i++) {
+        uint8_t colorValue = grbValues[i];
+
+        for (int k = 0; k < 8; k++) {
+            int index = 8 * i + k;
+            int bitMask = 1 << (7 - k);
+            int bitValue = colorValue & bitMask;
+
+            ledPWMPeriods[index] = bitValue ? 100 : 50;
+        }
+    }
+}
 
 void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t size) {
   if (size == sizeof(uartRxData)) {
@@ -126,10 +145,13 @@ int main(void)
   MX_TIM16_Init();
   MX_USART3_UART_Init();
   MX_CRC_Init();
+  MX_TIM17_Init();
   /* USER CODE BEGIN 2 */
   HAL_TIM_PWM_Start(&htim16, TIM_CHANNEL_1);
   //__HAL_UART_ENABLE_IT(&huart3, UART_IT_IDLE);
   HAL_UARTEx_ReceiveToIdle_DMA(&huart3, uartRxDataDMA, sizeof(uartRxDataDMA));
+
+  ledPWMPeriods[48] = 0;
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -157,7 +179,7 @@ int main(void)
         uartRxData[i] = uartRxDataDMA[byteIndex];
       }
 
-      debugCommandCRCValue = HAL_CRC_Calculate(&hcrc, (uint32_t *) uartRxData, sizeof(debugCommand) / 4 - 1);
+      debugCommandCRCValue = HAL_CRC_Calculate(&hcrc, (uint32_t*)uartRxData, sizeof(debugCommand) / 4 - 1);
 
       uint32_t receivedCRCValue = ((uint32_t *) uartRxData)[sizeof(uartRxData) / 4 - 1]; // last uint32 in the buffer
 
@@ -168,13 +190,16 @@ int main(void)
       }
     }
 
-    HAL_Delay(500);
-
     if (shouldSendDebugInfo) {
       shouldSendDebugInfo = 0;
 
       HAL_UART_Transmit(&huart3, (uint8_t*)&debugCommand, sizeof(debugCommand), 1000);
     }
+
+    setLEDs(ledColorValues);
+    HAL_TIM_PWM_Start_DMA(&htim17, TIM_CHANNEL_1, (uint32_t*)ledPWMPeriods, sizeof(ledPWMPeriods) / sizeof(ledPWMPeriods[0]));
+
+    HAL_Delay(500);
   }
   /* USER CODE END 3 */
 }
@@ -327,6 +352,69 @@ static void MX_TIM16_Init(void)
 }
 
 /**
+  * @brief TIM17 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM17_Init(void)
+{
+
+  /* USER CODE BEGIN TIM17_Init 0 */
+
+  /* USER CODE END TIM17_Init 0 */
+
+  TIM_OC_InitTypeDef sConfigOC = {0};
+  TIM_BreakDeadTimeConfigTypeDef sBreakDeadTimeConfig = {0};
+
+  /* USER CODE BEGIN TIM17_Init 1 */
+
+  /* USER CODE END TIM17_Init 1 */
+  htim17.Instance = TIM17;
+  htim17.Init.Prescaler = 0;
+  htim17.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim17.Init.Period = 200;
+  htim17.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim17.Init.RepetitionCounter = 0;
+  htim17.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim17) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_TIM_PWM_Init(&htim17) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sConfigOC.OCMode = TIM_OCMODE_PWM1;
+  sConfigOC.Pulse = 50;
+  sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
+  sConfigOC.OCNPolarity = TIM_OCNPOLARITY_HIGH;
+  sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
+  sConfigOC.OCIdleState = TIM_OCIDLESTATE_RESET;
+  sConfigOC.OCNIdleState = TIM_OCNIDLESTATE_RESET;
+  if (HAL_TIM_PWM_ConfigChannel(&htim17, &sConfigOC, TIM_CHANNEL_1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sBreakDeadTimeConfig.OffStateRunMode = TIM_OSSR_DISABLE;
+  sBreakDeadTimeConfig.OffStateIDLEMode = TIM_OSSI_DISABLE;
+  sBreakDeadTimeConfig.LockLevel = TIM_LOCKLEVEL_OFF;
+  sBreakDeadTimeConfig.DeadTime = 0;
+  sBreakDeadTimeConfig.BreakState = TIM_BREAK_DISABLE;
+  sBreakDeadTimeConfig.BreakPolarity = TIM_BREAKPOLARITY_HIGH;
+  sBreakDeadTimeConfig.BreakFilter = 0;
+  sBreakDeadTimeConfig.AutomaticOutput = TIM_AUTOMATICOUTPUT_DISABLE;
+  if (HAL_TIMEx_ConfigBreakDeadTime(&htim17, &sBreakDeadTimeConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM17_Init 2 */
+
+  /* USER CODE END TIM17_Init 2 */
+  HAL_TIM_MspPostInit(&htim17);
+
+}
+
+/**
   * @brief USART3 Initialization Function
   * @param None
   * @retval None
@@ -388,6 +476,9 @@ static void MX_DMA_Init(void)
   /* DMA1_Channel1_IRQn interrupt configuration */
   HAL_NVIC_SetPriority(DMA1_Channel1_IRQn, 0, 0);
   HAL_NVIC_EnableIRQ(DMA1_Channel1_IRQn);
+  /* DMA1_Channel2_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA1_Channel2_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(DMA1_Channel2_IRQn);
 
 }
 
