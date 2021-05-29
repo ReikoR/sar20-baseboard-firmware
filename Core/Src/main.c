@@ -42,12 +42,28 @@ typedef struct __attribute__((packed)) DebugCommand {
 
 /* Private macro -------------------------------------------------------------*/
 /* USER CODE BEGIN PM */
+#define max(a,b)             \
+({                           \
+    __typeof__ (a) _a = (a); \
+    __typeof__ (b) _b = (b); \
+    _a > _b ? _a : _b;       \
+})
 
+#define min(a,b)             \
+({                           \
+    __typeof__ (a) _a = (a); \
+    __typeof__ (b) _b = (b); \
+    _a < _b ? _a : _b;       \
+})
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
+ADC_HandleTypeDef hadc1;
+DMA_HandleTypeDef hdma_adc1;
+
 CRC_HandleTypeDef hcrc;
 
+TIM_HandleTypeDef htim7;
 TIM_HandleTypeDef htim16;
 TIM_HandleTypeDef htim17;
 DMA_HandleTypeDef hdma_tim17_ch1;
@@ -73,6 +89,8 @@ static void MX_TIM16_Init(void);
 static void MX_USART3_UART_Init(void);
 static void MX_CRC_Init(void);
 static void MX_TIM17_Init(void);
+static void MX_ADC1_Init(void);
+static void MX_TIM7_Init(void);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
@@ -90,18 +108,27 @@ uint32_t shouldSendDebugInfo = 0;
 uint16_t ledPWMPeriods[49] = {};
 uint8_t ledColorValues[6] = {50, 50, 50, 50, 50, 50};
 
+uint16_t adcData[2] = {0, 0};
+uint32_t adcMeasurementsDone = 0;
+
+int limit(int value, int min, int max) {
+  if (value < min) return min;
+  if (value > max) return max;
+  return value;
+}
+
 void setLEDs(uint8_t grbValues[]) {
-    for (int i = 0; i < 6; i++) {
-        uint8_t colorValue = grbValues[i];
+  for (int i = 0; i < 6; i++) {
+    uint8_t colorValue = grbValues[i];
 
-        for (int k = 0; k < 8; k++) {
-            int index = 8 * i + k;
-            int bitMask = 1 << (7 - k);
-            int bitValue = colorValue & bitMask;
+    for (int k = 0; k < 8; k++) {
+      int index = 8 * i + k;
+      int bitMask = 1 << (7 - k);
+      int bitValue = colorValue & bitMask;
 
-            ledPWMPeriods[index] = bitValue ? 100 : 50;
-        }
+      ledPWMPeriods[index] = bitValue ? 100 : 50;
     }
+  }
 }
 
 void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t size) {
@@ -110,6 +137,10 @@ void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t size) {
     uartRxEventCallbackByteCounter += size;
     hasReceivedUARTCommand = 1;
   }
+}
+
+void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc) {
+  adcMeasurementsDone = 1;
 }
 /* USER CODE END 0 */
 
@@ -146,12 +177,19 @@ int main(void)
   MX_USART3_UART_Init();
   MX_CRC_Init();
   MX_TIM17_Init();
+  MX_ADC1_Init();
+  MX_TIM7_Init();
   /* USER CODE BEGIN 2 */
+  HAL_ADC_Start_DMA(&hadc1, (uint32_t*)adcData, 2);
+  HAL_ADC_Start_IT(&hadc1);
+  HAL_TIM_Base_Start(&htim7);
+
   HAL_TIM_PWM_Start(&htim16, TIM_CHANNEL_1);
-  //__HAL_UART_ENABLE_IT(&huart3, UART_IT_IDLE);
   HAL_UARTEx_ReceiveToIdle_DMA(&huart3, uartRxDataDMA, sizeof(uartRxDataDMA));
 
   ledPWMPeriods[48] = 0;
+  setLEDs(ledColorValues);
+  HAL_TIM_PWM_Start_DMA(&htim17, TIM_CHANNEL_1, (uint32_t*)ledPWMPeriods, sizeof(ledPWMPeriods) / sizeof(ledPWMPeriods[0]));
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -161,8 +199,6 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-    //crcOutputValue = HAL_CRC_Calculate(&hcrc, &crcInputData, 1);
-
     if (hasReceivedUARTCommand) {
       hasReceivedUARTCommand = 0;
 
@@ -193,13 +229,41 @@ int main(void)
     if (shouldSendDebugInfo) {
       shouldSendDebugInfo = 0;
 
-      HAL_UART_Transmit(&huart3, (uint8_t*)&debugCommand, sizeof(debugCommand), 1000);
+      //HAL_UART_Transmit(&huart3, (uint8_t*)&debugCommand, sizeof(debugCommand), 1000);
     }
 
-    setLEDs(ledColorValues);
-    HAL_TIM_PWM_Start_DMA(&htim17, TIM_CHANNEL_1, (uint32_t*)ledPWMPeriods, sizeof(ledPWMPeriods) / sizeof(ledPWMPeriods[0]));
+    if (adcMeasurementsDone == 1) {
+      adcMeasurementsDone = 0;
+      uint16_t mainBatteryVoltage_mV = adcData[0] / 2;
+      uint16_t motorsBatteryVoltage_mV = adcData[1] / 2;
+      HAL_UART_Transmit(&huart3, (uint8_t*)adcData, sizeof(adcData), 1000);
 
-    HAL_Delay(500);
+      int32_t mainBatteryChargePercentage = limit((mainBatteryVoltage_mV - 900) / 3, 0, 100);
+      int32_t motorsBatteryChargePercentage = limit((motorsBatteryVoltage_mV - 900) / 3, 0, 100);
+
+      if (motorsBatteryVoltage_mV > 10) {
+        ledColorValues[0] = motorsBatteryChargePercentage / 4;
+        ledColorValues[1] = (100 - motorsBatteryChargePercentage) / 4;
+        ledColorValues[2] = 0;
+      } else {
+        ledColorValues[0] = 0;
+        ledColorValues[1] = 0;
+        ledColorValues[2] = 25;
+      }
+
+      if (mainBatteryVoltage_mV > 10) {
+        ledColorValues[3] = mainBatteryChargePercentage / 4;
+        ledColorValues[4] = (100 - mainBatteryChargePercentage) / 4;
+        ledColorValues[5] = 0;
+      } else {
+        ledColorValues[3] = 0;
+        ledColorValues[4] = 0;
+        ledColorValues[5] = 25;
+      }
+
+      setLEDs(ledColorValues);
+      HAL_TIM_PWM_Start_DMA(&htim17, TIM_CHANNEL_1, (uint32_t*)ledPWMPeriods, sizeof(ledPWMPeriods) / sizeof(ledPWMPeriods[0]));
+    }
   }
   /* USER CODE END 3 */
 }
@@ -249,12 +313,86 @@ void SystemClock_Config(void)
   }
   /** Initializes the peripherals clocks
   */
-  PeriphClkInit.PeriphClockSelection = RCC_PERIPHCLK_USART3;
+  PeriphClkInit.PeriphClockSelection = RCC_PERIPHCLK_USART3|RCC_PERIPHCLK_ADC12;
   PeriphClkInit.Usart3ClockSelection = RCC_USART3CLKSOURCE_PCLK1;
+  PeriphClkInit.Adc12ClockSelection = RCC_ADC12CLKSOURCE_SYSCLK;
   if (HAL_RCCEx_PeriphCLKConfig(&PeriphClkInit) != HAL_OK)
   {
     Error_Handler();
   }
+}
+
+/**
+  * @brief ADC1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_ADC1_Init(void)
+{
+
+  /* USER CODE BEGIN ADC1_Init 0 */
+
+  /* USER CODE END ADC1_Init 0 */
+
+  ADC_MultiModeTypeDef multimode = {0};
+  ADC_ChannelConfTypeDef sConfig = {0};
+
+  /* USER CODE BEGIN ADC1_Init 1 */
+
+  /* USER CODE END ADC1_Init 1 */
+  /** Common config
+  */
+  hadc1.Instance = ADC1;
+  hadc1.Init.ClockPrescaler = ADC_CLOCK_SYNC_PCLK_DIV4;
+  hadc1.Init.Resolution = ADC_RESOLUTION_12B;
+  hadc1.Init.DataAlign = ADC_DATAALIGN_RIGHT;
+  hadc1.Init.GainCompensation = 0;
+  hadc1.Init.ScanConvMode = ADC_SCAN_ENABLE;
+  hadc1.Init.EOCSelection = ADC_EOC_SEQ_CONV;
+  hadc1.Init.LowPowerAutoWait = DISABLE;
+  hadc1.Init.ContinuousConvMode = DISABLE;
+  hadc1.Init.NbrOfConversion = 2;
+  hadc1.Init.DiscontinuousConvMode = DISABLE;
+  hadc1.Init.ExternalTrigConv = ADC_EXTERNALTRIG_T7_TRGO;
+  hadc1.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_RISING;
+  hadc1.Init.DMAContinuousRequests = ENABLE;
+  hadc1.Init.Overrun = ADC_OVR_DATA_OVERWRITTEN;
+  hadc1.Init.OversamplingMode = DISABLE;
+  if (HAL_ADC_Init(&hadc1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /** Configure the ADC multi-mode
+  */
+  multimode.Mode = ADC_MODE_INDEPENDENT;
+  if (HAL_ADCEx_MultiModeConfigChannel(&hadc1, &multimode) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /** Configure Regular Channel
+  */
+  sConfig.Channel = ADC_CHANNEL_2;
+  sConfig.Rank = ADC_REGULAR_RANK_1;
+  sConfig.SamplingTime = ADC_SAMPLETIME_6CYCLES_5;
+  sConfig.SingleDiff = ADC_SINGLE_ENDED;
+  sConfig.OffsetNumber = ADC_OFFSET_NONE;
+  sConfig.Offset = 0;
+  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /** Configure Regular Channel
+  */
+  sConfig.Channel = ADC_CHANNEL_14;
+  sConfig.Rank = ADC_REGULAR_RANK_2;
+  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN ADC1_Init 2 */
+
+  /* USER CODE END ADC1_Init 2 */
+
 }
 
 /**
@@ -285,6 +423,44 @@ static void MX_CRC_Init(void)
   /* USER CODE BEGIN CRC_Init 2 */
 
   /* USER CODE END CRC_Init 2 */
+
+}
+
+/**
+  * @brief TIM7 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM7_Init(void)
+{
+
+  /* USER CODE BEGIN TIM7_Init 0 */
+
+  /* USER CODE END TIM7_Init 0 */
+
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+
+  /* USER CODE BEGIN TIM7_Init 1 */
+
+  /* USER CODE END TIM7_Init 1 */
+  htim7.Instance = TIM7;
+  htim7.Init.Prescaler = 249;
+  htim7.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim7.Init.Period = 63999;
+  htim7.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim7) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_UPDATE;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim7, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM7_Init 2 */
+
+  /* USER CODE END TIM7_Init 2 */
 
 }
 
@@ -479,6 +655,9 @@ static void MX_DMA_Init(void)
   /* DMA1_Channel2_IRQn interrupt configuration */
   HAL_NVIC_SetPriority(DMA1_Channel2_IRQn, 0, 0);
   HAL_NVIC_EnableIRQ(DMA1_Channel2_IRQn);
+  /* DMA1_Channel3_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA1_Channel3_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(DMA1_Channel3_IRQn);
 
 }
 
@@ -492,6 +671,7 @@ static void MX_GPIO_Init(void)
 
   /* GPIO Ports Clock Enable */
   __HAL_RCC_GPIOA_CLK_ENABLE();
+  __HAL_RCC_GPIOB_CLK_ENABLE();
   __HAL_RCC_GPIOC_CLK_ENABLE();
 
 }
