@@ -18,6 +18,7 @@
   */
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
+#include <string.h>
 #include "main.h"
 
 /* Private includes ----------------------------------------------------------*/
@@ -27,7 +28,13 @@
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
-
+typedef struct __attribute__((packed)) DebugCommand {
+  float speed1Hz;
+  float speed2Hz;
+  float speed3Hz;
+  uint32_t requestInfo;
+  uint32_t crcValue;
+} DebugCommand;
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
@@ -40,26 +47,51 @@
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
+CRC_HandleTypeDef hcrc;
+
 TIM_HandleTypeDef htim16;
 
 UART_HandleTypeDef huart3;
+DMA_HandleTypeDef hdma_usart3_rx;
 
 /* USER CODE BEGIN PV */
-
+DebugCommand debugCommand = {
+    .speed1Hz = 0.0f,
+    .speed2Hz = 0.0f,
+    .speed3Hz = 0.0f,
+    .requestInfo = 0,
+    .crcValue = 0
+};
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
+static void MX_DMA_Init(void);
 static void MX_TIM16_Init(void);
 static void MX_USART3_UART_Init(void);
+static void MX_CRC_Init(void);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-uint8_t uartTxData[4] = {'t', 'e', 's', 't'};
+uint8_t uartRxData[20];
+uint8_t uartRxDataDMA[20];
+uint32_t debugCommandCRCValue = 0;
+uint32_t uartRxEventCallbackCounter = 0;
+uint32_t uartRxEventCallbackByteCounter = 0;
+volatile uint32_t hasReceivedUARTCommand = 0;
+uint32_t shouldSendDebugInfo = 0;
+
+void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t size) {
+  if (size == sizeof(uartRxData)) {
+    uartRxEventCallbackCounter++;
+    uartRxEventCallbackByteCounter += size;
+    hasReceivedUARTCommand = 1;
+  }
+}
 /* USER CODE END 0 */
 
 /**
@@ -90,10 +122,14 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
+  MX_DMA_Init();
   MX_TIM16_Init();
   MX_USART3_UART_Init();
+  MX_CRC_Init();
   /* USER CODE BEGIN 2 */
   HAL_TIM_PWM_Start(&htim16, TIM_CHANNEL_1);
+  //__HAL_UART_ENABLE_IT(&huart3, UART_IT_IDLE);
+  HAL_UARTEx_ReceiveToIdle_DMA(&huart3, uartRxDataDMA, sizeof(uartRxDataDMA));
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -103,8 +139,42 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-    HAL_Delay(1000);
-    HAL_UART_Transmit(&huart3, uartTxData, sizeof(uartTxData), 1000);
+    //crcOutputValue = HAL_CRC_Calculate(&hcrc, &crcInputData, 1);
+
+    if (hasReceivedUARTCommand) {
+      hasReceivedUARTCommand = 0;
+
+      uint32_t uartRxDMACounter = __HAL_DMA_GET_COUNTER(huart3.hdmarx);
+      uint32_t firstByteIndex = sizeof(uartRxData) - uartRxDMACounter;
+
+      for (uint32_t i = 0; i < sizeof(uartRxData); i++) {
+        uint32_t byteIndex = firstByteIndex + i;
+
+        if (byteIndex >= sizeof(uartRxData)) {
+          byteIndex -= sizeof(uartRxData);
+        }
+
+        uartRxData[i] = uartRxDataDMA[byteIndex];
+      }
+
+      debugCommandCRCValue = HAL_CRC_Calculate(&hcrc, (uint32_t *) uartRxData, sizeof(debugCommand) / 4 - 1);
+
+      uint32_t receivedCRCValue = ((uint32_t *) uartRxData)[sizeof(uartRxData) / 4 - 1]; // last uint32 in the buffer
+
+      if (debugCommandCRCValue == receivedCRCValue) {
+        memcpy(&debugCommand, uartRxData, sizeof(uartRxData));
+
+        shouldSendDebugInfo = debugCommand.requestInfo;
+      }
+    }
+
+    HAL_Delay(500);
+
+    if (shouldSendDebugInfo) {
+      shouldSendDebugInfo = 0;
+
+      HAL_UART_Transmit(&huart3, (uint8_t*)&debugCommand, sizeof(debugCommand), 1000);
+    }
   }
   /* USER CODE END 3 */
 }
@@ -160,6 +230,37 @@ void SystemClock_Config(void)
   {
     Error_Handler();
   }
+}
+
+/**
+  * @brief CRC Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_CRC_Init(void)
+{
+
+  /* USER CODE BEGIN CRC_Init 0 */
+
+  /* USER CODE END CRC_Init 0 */
+
+  /* USER CODE BEGIN CRC_Init 1 */
+
+  /* USER CODE END CRC_Init 1 */
+  hcrc.Instance = CRC;
+  hcrc.Init.DefaultPolynomialUse = DEFAULT_POLYNOMIAL_ENABLE;
+  hcrc.Init.DefaultInitValueUse = DEFAULT_INIT_VALUE_ENABLE;
+  hcrc.Init.InputDataInversionMode = CRC_INPUTDATA_INVERSION_NONE;
+  hcrc.Init.OutputDataInversionMode = CRC_OUTPUTDATA_INVERSION_DISABLE;
+  hcrc.InputDataFormat = CRC_INPUTDATA_FORMAT_WORDS;
+  if (HAL_CRC_Init(&hcrc) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN CRC_Init 2 */
+
+  /* USER CODE END CRC_Init 2 */
+
 }
 
 /**
@@ -270,6 +371,23 @@ static void MX_USART3_UART_Init(void)
   /* USER CODE BEGIN USART3_Init 2 */
 
   /* USER CODE END USART3_Init 2 */
+
+}
+
+/**
+  * Enable DMA controller clock
+  */
+static void MX_DMA_Init(void)
+{
+
+  /* DMA controller clock enable */
+  __HAL_RCC_DMAMUX1_CLK_ENABLE();
+  __HAL_RCC_DMA1_CLK_ENABLE();
+
+  /* DMA interrupt init */
+  /* DMA1_Channel1_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA1_Channel1_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(DMA1_Channel1_IRQn);
 
 }
 
