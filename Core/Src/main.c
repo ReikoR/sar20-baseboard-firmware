@@ -27,7 +27,21 @@
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
-typedef struct __attribute__((packed)) DebugCommand {
+typedef struct MainCommand {
+  float speed1Hz;
+  float speed2Hz;
+  float speed3Hz;
+  uint32_t crcValue;
+} MainCommand;
+
+typedef struct MainFeedback {
+  uint32_t value1;
+  uint32_t value2;
+  uint32_t value3;
+  uint32_t crcValue;
+} MainFeedback;
+
+typedef struct DebugCommand {
   float speed1Hz;
   float speed2Hz;
   float speed3Hz;
@@ -82,7 +96,10 @@ DMA_HandleTypeDef hdma_adc1;
 
 CRC_HandleTypeDef hcrc;
 
+SPI_HandleTypeDef hspi1;
 SPI_HandleTypeDef hspi2;
+DMA_HandleTypeDef hdma_spi1_rx;
+DMA_HandleTypeDef hdma_spi1_tx;
 DMA_HandleTypeDef hdma_spi2_rx;
 
 TIM_HandleTypeDef htim1;
@@ -100,6 +117,20 @@ UART_HandleTypeDef huart3;
 DMA_HandleTypeDef hdma_usart3_rx;
 
 /* USER CODE BEGIN PV */
+MainCommand mainCommand = {
+    .speed1Hz = 0.0f,
+    .speed2Hz = 0.0f,
+    .speed3Hz = 0.0f,
+    .crcValue = 0
+};
+
+MainFeedback mainFeedback = {
+    .value1 = 1,
+    .value2 = 2,
+    .value3 = 3,
+    .crcValue = 0
+};
+
 DebugCommand debugCommand = {
     .speed1Hz = 0.0f,
     .speed2Hz = 0.0f,
@@ -144,6 +175,7 @@ static void MX_TIM20_Init(void);
 static void MX_SPI2_Init(void);
 static void MX_TIM4_Init(void);
 static void MX_TIM15_Init(void);
+static void MX_SPI1_Init(void);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
@@ -162,6 +194,9 @@ uint8_t ledColorValues[6] = {50, 50, 50, 50, 50, 50};
 
 uint16_t adcData[2] = {0, 0};
 uint32_t adcMeasurementsDone = 0;
+
+volatile uint32_t hasReceivedMainCommand = 0;
+uint32_t mainCommandCRCValue = 0;
 
 int limit(int value, int min, int max) {
   if (value < min) return min;
@@ -187,6 +222,10 @@ void setLEDs(uint8_t grbValues[]) {
       ledPWMPeriods[index] = bitValue ? 100 : 50;
     }
   }
+}
+
+void HAL_SPI_RxCpltCallback(SPI_HandleTypeDef *hspi) {
+  hasReceivedMainCommand = 1;
 }
 
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
@@ -239,6 +278,7 @@ int main(void)
   MX_SPI2_Init();
   MX_TIM4_Init();
   MX_TIM15_Init();
+  MX_SPI1_Init();
   /* USER CODE BEGIN 2 */
   HAL_ADC_Start_DMA(&hadc1, (uint32_t*)adcData, 2);
   HAL_ADC_Start_IT(&hadc1);
@@ -269,8 +309,8 @@ int main(void)
   htim4.Instance->ARR = nssPeriod * 4 - 1;
   htim4.Instance->CNT = 0;
 
-  HAL_SPI_Receive_DMA(&hspi2, &motorsFeedback, 3);
-  HAL_DMA_Start(&hdma_tim4_up, &motorsCommand, &(hspi2.Instance->DR), 3);
+  HAL_SPI_Receive_DMA(&hspi2, (uint8_t*)&motorsFeedback, 3);
+  HAL_DMA_Start(&hdma_tim4_up, (uint32_t)&motorsCommand, (uint32_t)&(hspi2.Instance->DR), 3);
   __HAL_TIM_ENABLE_DMA(&htim4, TIM_DMA_UPDATE);
   // TIM20 for NSS3
   HAL_TIM_PWM_Start(&htim20, TIM_CHANNEL_1);
@@ -285,6 +325,8 @@ int main(void)
   HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_4);
 
   HAL_TIM_Base_Start(&htim4);
+
+  HAL_SPI_TransmitReceive_DMA(&hspi1, (uint8_t*)&mainFeedback, (uint8_t*)&mainCommand, sizeof(mainCommand));
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -294,6 +336,16 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+    if (hasReceivedMainCommand) {
+      hasReceivedMainCommand = 0;
+
+      mainCommandCRCValue = HAL_CRC_Calculate(&hcrc, (uint32_t*)&mainCommand, sizeof(mainCommand) / 4 - 1);
+
+      if (mainCommandCRCValue == mainCommand.crcValue) {
+        setMotorSpeedCommand(&motorsCommand, mainCommand.speed1Hz, mainCommand.speed2Hz, mainCommand.speed3Hz);
+      }
+    }
+
     if (hasReceivedUARTCommand) {
       hasReceivedUARTCommand = 0;
 
@@ -319,11 +371,10 @@ int main(void)
       HAL_UART_Transmit(&huart3, (uint8_t*)&debugFeedback, sizeof(debugFeedback), 1000);
     }
 
-    if (adcMeasurementsDone == 1) {
+    if (adcMeasurementsDone) {
       adcMeasurementsDone = 0;
       uint16_t mainBatteryVoltage_mV = adcData[0] / 2;
       uint16_t motorsBatteryVoltage_mV = adcData[1] / 2;
-      //HAL_UART_Transmit(&huart3, (uint8_t*)adcData, sizeof(adcData), 1000);
 
       int32_t mainBatteryChargePercentage = limit((mainBatteryVoltage_mV - 900) / 3, 0, 100);
       int32_t motorsBatteryChargePercentage = limit((motorsBatteryVoltage_mV - 900) / 3, 0, 100);
@@ -351,6 +402,8 @@ int main(void)
       setLEDs(ledColorValues);
       HAL_TIM_PWM_Start_DMA(&htim17, TIM_CHANNEL_1, (uint32_t*)ledPWMPeriods, sizeof(ledPWMPeriods) / sizeof(ledPWMPeriods[0]));
     }
+
+    mainFeedback.crcValue = HAL_CRC_Calculate(&hcrc, (uint32_t*)&mainFeedback, sizeof(mainFeedback) / 4 - 1);
   }
   /* USER CODE END 3 */
 }
@@ -510,6 +563,45 @@ static void MX_CRC_Init(void)
   /* USER CODE BEGIN CRC_Init 2 */
 
   /* USER CODE END CRC_Init 2 */
+
+}
+
+/**
+  * @brief SPI1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_SPI1_Init(void)
+{
+
+  /* USER CODE BEGIN SPI1_Init 0 */
+
+  /* USER CODE END SPI1_Init 0 */
+
+  /* USER CODE BEGIN SPI1_Init 1 */
+
+  /* USER CODE END SPI1_Init 1 */
+  /* SPI1 parameter configuration*/
+  hspi1.Instance = SPI1;
+  hspi1.Init.Mode = SPI_MODE_SLAVE;
+  hspi1.Init.Direction = SPI_DIRECTION_2LINES;
+  hspi1.Init.DataSize = SPI_DATASIZE_8BIT;
+  hspi1.Init.CLKPolarity = SPI_POLARITY_LOW;
+  hspi1.Init.CLKPhase = SPI_PHASE_1EDGE;
+  hspi1.Init.NSS = SPI_NSS_SOFT;
+  hspi1.Init.FirstBit = SPI_FIRSTBIT_MSB;
+  hspi1.Init.TIMode = SPI_TIMODE_DISABLE;
+  hspi1.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
+  hspi1.Init.CRCPolynomial = 7;
+  hspi1.Init.CRCLength = SPI_CRC_LENGTH_DATASIZE;
+  hspi1.Init.NSSPMode = SPI_NSS_PULSE_DISABLE;
+  if (HAL_SPI_Init(&hspi1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN SPI1_Init 2 */
+
+  /* USER CODE END SPI1_Init 2 */
 
 }
 
@@ -1147,6 +1239,12 @@ static void MX_DMA_Init(void)
   /* DMA1_Channel5_IRQn interrupt configuration */
   HAL_NVIC_SetPriority(DMA1_Channel5_IRQn, 0, 0);
   HAL_NVIC_EnableIRQ(DMA1_Channel5_IRQn);
+  /* DMA1_Channel6_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA1_Channel6_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(DMA1_Channel6_IRQn);
+  /* DMA1_Channel7_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA1_Channel7_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(DMA1_Channel7_IRQn);
 
 }
 
