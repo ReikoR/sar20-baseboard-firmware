@@ -35,9 +35,10 @@ typedef struct MainCommand {
 } MainCommand;
 
 typedef struct MainFeedback {
-  uint32_t value1;
-  uint32_t value2;
-  uint32_t value3;
+  uint16_t position1;
+  uint16_t position2;
+  uint16_t position3;
+  int16_t distances[12];
   uint32_t crcValue;
 } MainFeedback;
 
@@ -53,6 +54,7 @@ typedef struct __attribute__((packed)) DebugFeedback {
   uint16_t position1;
   uint16_t position2;
   uint16_t position3;
+  int16_t distances[12];
   uint16_t delimiter;
 } DebugFeedback;
 
@@ -67,6 +69,10 @@ typedef struct __attribute__((packed)) MotorsFeedback {
   uint16_t position2;
   uint16_t position3;
 } MotorsFeedback;
+
+typedef struct __attribute__((packed)) DistanceFeedback {
+  int16_t distances[12];
+} DistanceFeedback;
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
@@ -113,7 +119,10 @@ TIM_HandleTypeDef htim20;
 DMA_HandleTypeDef hdma_tim4_up;
 DMA_HandleTypeDef hdma_tim17_ch1;
 
+UART_HandleTypeDef huart2;
 UART_HandleTypeDef huart3;
+DMA_HandleTypeDef hdma_usart2_rx;
+DMA_HandleTypeDef hdma_usart2_tx;
 DMA_HandleTypeDef hdma_usart3_rx;
 
 /* USER CODE BEGIN PV */
@@ -125,9 +134,10 @@ MainCommand mainCommand = {
 };
 
 MainFeedback mainFeedback = {
-    .value1 = 1,
-    .value2 = 2,
-    .value3 = 3,
+    .position1 = 0,
+    .position2 = 0,
+    .position3 = 0,
+    .distances = {},
     .crcValue = 0
 };
 
@@ -143,6 +153,7 @@ DebugFeedback debugFeedback = {
     .position1 = 0,
     .position2 = 0,
     .position3 = 0,
+    .distances = {},
     .delimiter = 0xAAAA
 };
 
@@ -156,6 +167,10 @@ MotorsFeedback motorsFeedback = {
     .position1 = 0,
     .position2 = 0,
     .position3 = 0
+};
+
+DistanceFeedback distanceFeedback = {
+    .distances = {}
 };
 /* USER CODE END PV */
 
@@ -176,6 +191,7 @@ static void MX_SPI2_Init(void);
 static void MX_TIM4_Init(void);
 static void MX_TIM15_Init(void);
 static void MX_SPI1_Init(void);
+static void MX_USART2_UART_Init(void);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
@@ -187,6 +203,7 @@ uint32_t debugCommandCRCValue = 0;
 uint32_t uartRxEventCallbackCounter = 0;
 uint32_t uartRxEventCallbackByteCounter = 0;
 volatile uint32_t hasReceivedUARTCommand = 0;
+volatile uint32_t hasReceivedDistanceFeedback = 0;
 uint32_t shouldSendDebugInfo = 0;
 
 uint16_t ledPWMPeriods[49] = {};
@@ -229,7 +246,11 @@ void HAL_SPI_RxCpltCallback(SPI_HandleTypeDef *hspi) {
 }
 
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
-  hasReceivedUARTCommand = 1;
+  if (huart == &huart2) {
+    hasReceivedDistanceFeedback = 1;
+  } else if (huart == &huart3) {
+    hasReceivedUARTCommand = 1;
+  }
 }
 
 void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc) {
@@ -279,10 +300,13 @@ int main(void)
   MX_TIM4_Init();
   MX_TIM15_Init();
   MX_SPI1_Init();
+  MX_USART2_UART_Init();
   /* USER CODE BEGIN 2 */
   HAL_ADC_Start_DMA(&hadc1, (uint32_t*)adcData, 2);
   HAL_ADC_Start_IT(&hadc1);
   HAL_TIM_Base_Start(&htim7);
+
+  HAL_UART_Receive_DMA(&huart2, (uint8_t*)&distanceFeedback, sizeof(distanceFeedback));
 
   HAL_TIM_PWM_Start(&htim16, TIM_CHANNEL_1);
   HAL_UART_Receive_DMA(&huart3, uartRxData, sizeof(uartRxData));
@@ -346,6 +370,12 @@ int main(void)
       }
     }
 
+    if (hasReceivedDistanceFeedback) {
+      hasReceivedDistanceFeedback = 0;
+
+      memcpy(mainFeedback.distances, distanceFeedback.distances, sizeof(mainFeedback.distances));
+    }
+
     if (hasReceivedUARTCommand) {
       hasReceivedUARTCommand = 0;
 
@@ -367,6 +397,8 @@ int main(void)
       debugFeedback.position1 = motorsFeedback.position1;
       debugFeedback.position2 = motorsFeedback.position2;
       debugFeedback.position3 = motorsFeedback.position3;
+
+      memcpy(debugFeedback.distances, distanceFeedback.distances, sizeof(debugFeedback.distances));
 
       HAL_UART_Transmit(&huart3, (uint8_t*)&debugFeedback, sizeof(debugFeedback), 1000);
     }
@@ -403,6 +435,9 @@ int main(void)
       HAL_TIM_PWM_Start_DMA(&htim17, TIM_CHANNEL_1, (uint32_t*)ledPWMPeriods, sizeof(ledPWMPeriods) / sizeof(ledPWMPeriods[0]));
     }
 
+    mainFeedback.position1 = motorsFeedback.position1;
+    mainFeedback.position2 = motorsFeedback.position2;
+    mainFeedback.position3 = motorsFeedback.position3;
     mainFeedback.crcValue = HAL_CRC_Calculate(&hcrc, (uint32_t*)&mainFeedback, sizeof(mainFeedback) / 4 - 1);
   }
   /* USER CODE END 3 */
@@ -453,7 +488,9 @@ void SystemClock_Config(void)
   }
   /** Initializes the peripherals clocks
   */
-  PeriphClkInit.PeriphClockSelection = RCC_PERIPHCLK_USART3|RCC_PERIPHCLK_ADC12;
+  PeriphClkInit.PeriphClockSelection = RCC_PERIPHCLK_USART2|RCC_PERIPHCLK_USART3
+                              |RCC_PERIPHCLK_ADC12;
+  PeriphClkInit.Usart2ClockSelection = RCC_USART2CLKSOURCE_PCLK1;
   PeriphClkInit.Usart3ClockSelection = RCC_USART3CLKSOURCE_PCLK1;
   PeriphClkInit.Adc12ClockSelection = RCC_ADC12CLKSOURCE_SYSCLK;
   if (HAL_RCCEx_PeriphCLKConfig(&PeriphClkInit) != HAL_OK)
@@ -1166,6 +1203,54 @@ static void MX_TIM20_Init(void)
 }
 
 /**
+  * @brief USART2 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_USART2_UART_Init(void)
+{
+
+  /* USER CODE BEGIN USART2_Init 0 */
+
+  /* USER CODE END USART2_Init 0 */
+
+  /* USER CODE BEGIN USART2_Init 1 */
+
+  /* USER CODE END USART2_Init 1 */
+  huart2.Instance = USART2;
+  huart2.Init.BaudRate = 1000000;
+  huart2.Init.WordLength = UART_WORDLENGTH_8B;
+  huart2.Init.StopBits = UART_STOPBITS_1;
+  huart2.Init.Parity = UART_PARITY_NONE;
+  huart2.Init.Mode = UART_MODE_TX_RX;
+  huart2.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart2.Init.OverSampling = UART_OVERSAMPLING_16;
+  huart2.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;
+  huart2.Init.ClockPrescaler = UART_PRESCALER_DIV1;
+  huart2.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_NO_INIT;
+  if (HAL_UART_Init(&huart2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_UARTEx_SetTxFifoThreshold(&huart2, UART_TXFIFO_THRESHOLD_1_8) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_UARTEx_SetRxFifoThreshold(&huart2, UART_RXFIFO_THRESHOLD_1_8) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_UARTEx_DisableFifoMode(&huart2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN USART2_Init 2 */
+
+  /* USER CODE END USART2_Init 2 */
+
+}
+
+/**
   * @brief USART3 Initialization Function
   * @param None
   * @retval None
@@ -1222,6 +1307,7 @@ static void MX_DMA_Init(void)
   /* DMA controller clock enable */
   __HAL_RCC_DMAMUX1_CLK_ENABLE();
   __HAL_RCC_DMA1_CLK_ENABLE();
+  __HAL_RCC_DMA2_CLK_ENABLE();
 
   /* DMA interrupt init */
   /* DMA1_Channel1_IRQn interrupt configuration */
@@ -1245,6 +1331,12 @@ static void MX_DMA_Init(void)
   /* DMA1_Channel7_IRQn interrupt configuration */
   HAL_NVIC_SetPriority(DMA1_Channel7_IRQn, 0, 0);
   HAL_NVIC_EnableIRQ(DMA1_Channel7_IRQn);
+  /* DMA2_Channel1_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA2_Channel1_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(DMA2_Channel1_IRQn);
+  /* DMA1_Channel8_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA1_Channel8_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(DMA1_Channel8_IRQn);
 
 }
 
